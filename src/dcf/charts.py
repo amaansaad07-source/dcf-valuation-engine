@@ -176,42 +176,71 @@ def plot_football_field(
     base_case: Optional[float] = None,
     ax=None,
 ):
-    """Football field: every valuation methodology as a horizontal range on one axis."""
+    """Football field: every valuation methodology as a horizontal range on one axis.
+
+    Label placement is computed from the data extent rather than hardcoded, so range
+    labels sit clear of their bars and the current-price callout stays clear of the title
+    regardless of how wide or narrow the ranges turn out to be.
+    """
     created = ax is None
     if created:
-        _, ax = plt.subplots(figsize=(10.5, 0.75 * len(ranges) + 2.4))
+        _, ax = plt.subplots(figsize=(11, 0.8 * len(ranges) + 2.6))
 
-    labels = list(ranges.keys())
+    valid = {k: (min(v), max(v)) for k, v in ranges.items()
+             if np.isfinite(v[0]) and np.isfinite(v[1])}
+    if not valid:
+        ax.text(0.5, 0.5, "No valid ranges to plot", ha="center", va="center",
+                transform=ax.transAxes, color=PALETTE["grey"])
+        return ax
+
+    labels = list(valid.keys())
     y = np.arange(len(labels))[::-1]
     colours = [PALETTE["navy"], PALETTE["blue"], PALETTE["teal"], PALETTE["sky"],
                PALETTE["gold"], PALETTE["grey"]]
 
-    for idx, (label, (low, high)) in enumerate(ranges.items()):
-        if not (np.isfinite(low) and np.isfinite(high)):
-            continue
-        low, high = min(low, high), max(low, high)
-        ax.barh(y[idx], high - low, left=low, height=0.52,
-                color=colours[idx % len(colours)], alpha=0.88, zorder=3)
-        ax.text(low, y[idx], f"  ${low:,.0f}  ", va="center", ha="right",
+    # Work out the full horizontal extent first, including the price markers, then reserve
+    # margin on each side for the end labels. Without this the labels collide with the bars.
+    points = [v for pair in valid.values() for v in pair]
+    if current_price:
+        points.append(current_price)
+    if base_case:
+        points.append(base_case)
+    lo_x, hi_x = min(points), max(points)
+    span = (hi_x - lo_x) or max(abs(hi_x), 1.0)
+    pad = span * 0.16
+    ax.set_xlim(lo_x - pad, hi_x + pad)
+    gap = span * 0.015                                  # breathing room around each label
+
+    for idx, (label, (low, high)) in enumerate(valid.items()):
+        ax.barh(y[idx], high - low, left=low, height=0.5,
+                color=colours[idx % len(colours)], alpha=0.9, zorder=3)
+        ax.text(low - gap, y[idx], f"${low:,.0f}", va="center", ha="right",
                 fontsize=8.5, color=PALETTE["ink"])
-        ax.text(high, y[idx], f"  ${high:,.0f}", va="center", ha="left",
+        ax.text(high + gap, y[idx], f"${high:,.0f}", va="center", ha="left",
                 fontsize=8.5, color=PALETTE["ink"])
+
+    # Price markers get their own row of headroom above the bars so the callout text can
+    # never reach the title.
+    top = len(labels) - 0.45
+    ax.set_ylim(-0.85, top + 0.75)
 
     if current_price:
         ax.axvline(current_price, color=PALETTE["red"], linestyle="--", linewidth=1.8, zorder=5)
-        ax.annotate(f"Current price ${current_price:,.2f}",
-                    xy=(current_price, len(labels) - 0.35), color=PALETTE["red"],
-                    fontsize=9, fontweight="bold", ha="center", va="bottom")
+        ax.annotate(f"Current price  ${current_price:,.2f}",
+                    xy=(current_price, top + 0.30), color=PALETTE["red"], fontsize=9,
+                    fontweight="bold", ha="center", va="center",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor=PALETTE["paper"],
+                              edgecolor=PALETTE["red"], linewidth=0.8))
     if base_case:
         ax.axvline(base_case, color=PALETTE["ink"], linestyle=":", linewidth=1.5, zorder=5)
-        ax.annotate(f"DCF base ${base_case:,.2f}", xy=(base_case, -0.62),
-                    color=PALETTE["ink"], fontsize=8.5, ha="center", annotation_clip=False)
-    ax.set_ylim(-0.9, len(labels) - 0.25)
+        ax.annotate(f"DCF base  ${base_case:,.2f}", xy=(base_case, -0.62),
+                    color=PALETTE["ink"], fontsize=8.5, ha="center", va="center",
+                    annotation_clip=False)
 
     ax.set_yticks(y)
     ax.set_yticklabels(labels, fontsize=9.5)
     ax.set_xlabel("Implied value per share")
-    ax.set_title("Football field — valuation range by methodology")
+    ax.set_title("Football field — valuation range by methodology", pad=14)
     ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"${v:,.0f}"))
     ax.grid(axis="y", visible=False)
     ax.spines[["top", "right", "left"]].set_visible(False)
