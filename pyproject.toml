@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dcf-valuation-engine"
+version = "1.0.0"
+description = "Automated DCF valuation engine driven by SEC XBRL filings"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "scipy>=1.11.0",
+    "matplotlib>=3.7.0",
+    "requests>=2.31.0",
+    "numpy-financial>=1.0.0",
+    "openpyxl>=3.1.0",
+]
+
+[project.optional-dependencies]
+app = ["streamlit>=1.50.0", "yfinance>=0.2.40"]
+dev = ["pytest>=7.4.0", "ruff>=0.5.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Pyflakes (real bugs), pycodestyle errors, and import ordering. Deliberately not the
+# opinionated rule sets — this is a finance model, not a style exercise.
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",   # line length is enforced by the formatter, not the linter
+    "E741",   # single-letter names like `g` for growth are the domain convention
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["dcf"]
