@@ -264,3 +264,111 @@ def test_excel_export(valuation, tmp_path):
     sheets = pd.ExcelFile(paths["excel"]).sheet_names
     for expected in ("Summary", "Historical drivers", "WACC", "Sensitivity", "XBRL tag audit"):
         assert expected in sheets
+
+
+# ------------------------------------------------------------------- loss-maker regime
+def _loss_maker_facts():
+    """Minimal pre-profitability filer: 4 years, deep operating losses, heavy capex."""
+    from datetime import date
+    dur, ins = {}, {}
+    revs = [0.5e9, 1.2e9, 1.6e9, 1.9e9]
+    for k in range(4):
+        end, fy = date(2021 + k, 12, 31), 2021 + k
+        start = date(end.year, 1, 1)
+        rev, ebit = revs[k], revs[k] * (-2.5 + 0.4 * k)
+        def dur_f(v, start=start, end=end, fy=fy):
+            return {"start": start.isoformat(), "end": end.isoformat(), "val": v,
+                    "form": "10-K", "filed": f"{fy+1}-02-15", "fy": fy, "fp": "FY"}
+
+        def inst_f(v, end=end, fy=fy):
+            return {"end": end.isoformat(), "val": v, "form": "10-K",
+                    "filed": f"{fy+1}-02-15", "fy": fy, "fp": "FY"}
+        for t, v in {
+            "RevenueFromContractWithCustomerExcludingAssessedTax": rev,
+            "OperatingIncomeLoss": ebit,
+            "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest": ebit,
+            "IncomeTaxExpenseBenefit": 1e6, "NetIncomeLoss": ebit,
+            "InterestExpense": 60e6,
+            "DepreciationDepletionAndAmortization": rev * 0.12,
+            "PaymentsToAcquirePropertyPlantAndEquipment": rev * 0.7,
+            "NetCashProvidedByUsedInOperatingActivities": ebit * 0.8,
+        }.items():
+            dur.setdefault(t, []).append(dur_f(v))
+        for t, v in {
+            "CashAndCashEquivalentsAtCarryingValue": 3e9, "AccountsReceivableNetCurrent": rev * 0.1,
+            "InventoryNet": rev * 0.9, "AccountsPayableCurrent": rev * 0.3,
+            "AssetsCurrent": 3e9 + rev, "LiabilitiesCurrent": rev * 0.5,
+            "LongTermDebtNoncurrent": 2e9, "StockholdersEquity": 2e9, "Assets": 8e9,
+        }.items():
+            ins.setdefault(t, []).append(inst_f(v))
+        dur.setdefault("WeightedAverageNumberOfDilutedSharesOutstanding", []).append(dur_f(2e9))
+    f = {"entityName": "LossCo",
+         "facts": {"us-gaap": {t: {"units": {"USD": r}} for t, r in {**dur, **ins}.items()}}}
+    f["facts"]["us-gaap"]["WeightedAverageNumberOfDilutedSharesOutstanding"] = {
+        "units": {"shares": dur["WeightedAverageNumberOfDilutedSharesOutstanding"]}}
+    return f
+
+
+@pytest.fixture
+def loss_maker(monkeypatch):
+    facts = _loss_maker_facts()
+    monkeypatch.setattr(sec_client.SECClient, "resolve_cik", lambda self, t: (77, "LossCo"))
+    monkeypatch.setattr(sec_client.SECClient, "company_facts", lambda self, cik: facts)
+    monkeypatch.setattr(market_data, "fetch_risk_free_rate", lambda series=None: 0.0428)
+
+
+def test_no_tax_subsidy_on_losses(loss_maker):
+    """NOPAT must equal EBIT when EBIT is negative — losses are not taxed into refunds."""
+    val = engine.run_valuation("LOSS", price_override=3.0, shares_override=2e9,
+                               beta_override=1.7, n_sims=2000, verbose=False)
+    proj = val.gordon.projection
+    ebit = proj.loc["EBIT"]
+    taxes = proj.loc["Taxes on EBIT"]
+    for e, t in zip(ebit, taxes):
+        if e < 0:
+            assert t == 0.0
+        else:
+            assert t == pytest.approx(-e * val.assumptions.tax_rate)
+
+
+def test_loss_maker_flagged_unsuitable(loss_maker):
+    val = engine.run_valuation("LOSS", price_override=3.0, shares_override=2e9,
+                               beta_override=1.7, n_sims=2000, verbose=False)
+    verdict, issues = val.suitability
+    assert verdict == "unsuitable"
+    assert issues, "unsuitable verdict must come with reasons"
+
+
+def test_monte_carlo_survives_all_negative_paths(loss_maker):
+    """The old code filtered per_share > 0 and crashed (or lied) on loss-makers."""
+    val = engine.run_valuation("LOSS", price_override=3.0, shares_override=2e9,
+                               beta_override=1.7, n_sims=10_000, verbose=False)
+    mc = val.monte_carlo
+    assert mc.n_valid > 9_000
+    assert mc.share_negative > 0.90
+    assert mc.median < 0
+    assert mc.percentiles["5"] < mc.percentiles["95"]
+
+
+def test_mature_company_is_suitable(valuation):
+    verdict, issues = valuation.suitability
+    assert verdict == "suitable"
+    assert issues == []
+
+
+def test_heatmap_renders_when_all_cells_below_price(valuation):
+    """One-sided grids used to saturate solid red; must render with visible gradation."""
+    import matplotlib.pyplot as plt
+    grid = valuation.sensitivity
+    ax = engine.plot_sensitivity_heatmap(grid, current_price=10_000.0)  # absurdly high
+    assert ax is not None
+    plt.close("all")
+
+
+def test_monte_carlo_chart_handles_negative_distribution(loss_maker):
+    import matplotlib.pyplot as plt
+    val = engine.run_valuation("LOSS", price_override=3.0, shares_override=2e9,
+                               beta_override=1.7, n_sims=5_000, verbose=False)
+    ax = engine.plot_monte_carlo(val.monte_carlo, current_price=3.0)
+    assert ax is not None
+    plt.close("all")

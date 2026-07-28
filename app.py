@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from dcf import (  # noqa: E402
     CFG,
+    assess_dcf_suitability,
     build_driver_table,
     build_sensitivity_ranges,
     compute_wacc,
@@ -248,11 +249,24 @@ wacc_range, growth_range = build_sensitivity_ranges(wacc, term_g)
 grid = sensitivity_grid(drivers, assumptions, market.shares_diluted,
                         wacc_range, growth_range, market.price)
 scenarios = run_scenarios(drivers, assumptions, wacc, market.shares_diluted, market.price)
+# Sampling widths come from the company's own history, exactly as the engine seeds them,
+# so the "what is being sampled" table below shows the real distributions in force.
+import numpy as np  # noqa: E402
+
+_gvol = drivers["revenue_growth"].tail(5).std()
+_mvol = drivers["ebit_margin"].tail(5).std()
+mc_growth_sd = float(np.clip(_gvol if np.isfinite(_gvol) else 0.03, 0.01, 0.12))
+mc_margin_sd = float(np.clip(_mvol if np.isfinite(_mvol) else 0.02, 0.005, 0.08))
+mc_wacc_sd, mc_capex_sd = 0.010, 0.005
+mc_tg_bounds = (max(term_g - 0.015, 0.0), term_g, term_g + 0.007)
+
 mc = monte_carlo_dcf(
     drivers, assumptions, wacc, market.shares_diluted,
     bridge_adjustment=gordon.equity_value - gordon.enterprise_value,
     current_price=market.price, n_sims=n_sims,
-    terminal_growth_bounds=(max(term_g - 0.015, 0.0), term_g, term_g + 0.007),
+    growth_sd=mc_growth_sd, margin_sd=mc_margin_sd,
+    wacc_sd=mc_wacc_sd, capex_sd=mc_capex_sd,
+    terminal_growth_bounds=mc_tg_bounds,
 )
 diagnostics = valuation_diagnostics(gordon, drivers, report, market, wacc_result)
 
@@ -286,6 +300,27 @@ c5.metric("P(undervalued)", f"{mc.prob_above_price:.0%}",
           f"P10–P90 ${mc.percentiles['10']:,.0f}–${mc.percentiles['90']:,.0f}",
           delta_color="off")
 
+verdict, suitability_issues = assess_dcf_suitability(drivers)
+if verdict == "unsuitable":
+    st.error(
+        "**A single-stage DCF is the wrong tool for this company.** The numbers below are "
+        "computed and shown for transparency, but they should not be relied on. "
+        + " ".join(suitability_issues)
+        + " What practitioners do instead: extend the horizon to 10–15 years so steady "
+        "state lands inside the forecast, ramp margins explicitly to a peer-normalised "
+        "target, apply zero cash tax until accumulated losses are absorbed, and take the "
+        "terminal value off normalised EBITDA rather than a Gordon perpetuity."
+    )
+elif verdict == "caution":
+    st.warning("**Use with care.** " + " ".join(suitability_issues))
+
+if term_g > 0.030:
+    st.warning(
+        f"Terminal growth of {term_g:.2%} exceeds long-run nominal GDP (~2.0–2.5%). "
+        "A company growing faster than the economy forever eventually *becomes* the "
+        "economy — treat anything above 3% as a stress case, not a base case."
+    )
+
 flagged = diagnostics[diagnostics["Status"] == "REVIEW"]
 if not flagged.empty:
     with st.expander(f"⚠️ {len(flagged)} diagnostic check(s) need review", expanded=False):
@@ -299,7 +334,7 @@ for note in market.warnings + wacc_result.notes:
 # ══════════════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════════════
-tabs = st.tabs(["Valuation", "Sensitivity", "Monte Carlo", "Football field",
+tabs = st.tabs(["Valuation", "Monte Carlo", "Sensitivity", "Football field",
                 "History", "WACC", "Audit"])
 
 with tabs[0]:
@@ -309,21 +344,161 @@ with tabs[0]:
     with right:
         show(plot_ufcf_bridge(gordon))
 
+    # ---- How the number is built: every step, as numbers, verifiable by hand ----------
+    st.subheader("How the number is built")
+    b1, b2, b3 = st.columns(3)
+
+    with b1:
+        st.markdown("**1 · Enterprise value**")
+        st.dataframe(pd.DataFrame({
+            "Component": ["PV of forecast UFCF (5y)", "PV of terminal value",
+                          "Enterprise value"],
+            "Amount": [fmt_money(gordon.pv_forecast), fmt_money(gordon.pv_terminal_value),
+                       fmt_money(gordon.enterprise_value)],
+        }), hide_index=True, width="stretch")
+        st.caption(f"Terminal value carries {gordon.tv_share_of_ev:.0%} of EV — "
+                   "60–80% is normal for a mature company.")
+
+    with b2:
+        st.markdown("**2 · Bridge to equity**")
+        bridge_rows = [(k, fmt_money(v)) for k, v in gordon.bridge.items()]
+        st.dataframe(pd.DataFrame(bridge_rows, columns=["Item", "Amount"]),
+                     hide_index=True, width="stretch")
+
+    with b3:
+        st.markdown("**3 · Per share**")
+        mos_intrinsic = (1 - market.price / gordon.value_per_share
+                         if gordon.value_per_share > 0 else float("nan"))
+        upside = gordon.upside_vs_price
+        st.dataframe(pd.DataFrame({
+            "Item": ["Equity value", "÷ Diluted shares", "Intrinsic value / share",
+                     "Current market price", "Upside vs price",
+                     "Margin of safety (vs intrinsic)"],
+            "Amount": [fmt_money(gordon.equity_value),
+                       f"{market.shares_diluted / 1e6:,.0f}mm",
+                       f"${gordon.value_per_share:,.2f}",
+                       f"${market.price:,.2f}",
+                       f"{upside:+.1%}" if upside is not None else "n/a",
+                       f"{mos_intrinsic:+.1%}" if np.isfinite(mos_intrinsic) else "n/a"],
+        }), hide_index=True, width="stretch")
+        st.caption("Margin of safety = 1 − price ÷ intrinsic. Positive means the market "
+                   "price sits below the model's value.")
+
+    with st.expander("Terminal value, step by step"):
+        ufcf_n = float(gordon.projection.loc["Unlevered FCF"].iloc[-1])
+        ebitda_n = float(gordon.projection.loc["EBITDA"].iloc[-1])
+        tv_period = (gordon.projection.loc["Discount period"].iloc[-1]
+                     if assumptions.mid_year_convention else float(assumptions.horizon))
+        df_tv = 1 / (1 + wacc) ** tv_period
+        st.markdown(
+            f"Gordon growth: TV = UFCF₍ₙ₎ × (1 + g) ÷ (WACC − g) = "
+            f"{fmt_money(ufcf_n)} × {1 + term_g:.4f} ÷ ({wacc:.2%} − {term_g:.2%}) = "
+            f"**{fmt_money(gordon.terminal_value)}**\n\n"
+            f"Discounted at period {tv_period:.1f}: × {df_tv:.4f} = "
+            f"**{fmt_money(gordon.pv_terminal_value)}** present value\n\n"
+            f"Cross-check — this TV implies an exit multiple of "
+            f"**{gordon.terminal_value / ebitda_n:.1f}× EBITDA**; your "
+            f"{exit_multiple:.1f}× exit-multiple case implies perpetual growth of "
+            f"**{exit_case.implied_growth_from_multiple:.2%}**. If those two disagree "
+            "violently, one of the terminal assumptions is wrong."
+        )
+
+    with st.expander("WACC, component by component"):
+        w = wacc_result
+        st.markdown(
+            f"Cost of equity (CAPM) = rf + β × ERP = {w.risk_free_rate:.2%} + "
+            f"{w.beta:.2f} × {w.equity_risk_premium:.2%} = **{w.cost_of_equity:.2%}**\n\n"
+            f"After-tax cost of debt = {w.cost_of_debt_pretax:.2%} × (1 − {w.tax_rate:.0%})"
+            f" = **{w.cost_of_debt_aftertax:.2%}**\n\n"
+            f"Weights (market value): equity {w.weight_equity:.0%} · debt "
+            f"{w.weight_debt:.0%}\n\n"
+            f"WACC = {w.weight_equity:.0%} × {w.cost_of_equity:.2%} + "
+            f"{w.weight_debt:.0%} × {w.cost_of_debt_aftertax:.2%} = **{w.wacc:.2%}**"
+            + (f"  — overridden by slider to **{wacc:.2%}**" if abs(wacc - w.wacc) > 1e-6
+               else "")
+        )
+        st.caption("Full build with sources on the WACC tab.")
+
+    with st.expander("Where the data comes from"):
+        yahoo_ok = not any("Yahoo" in n for n in market.warnings)
+        st.markdown(
+            f"**Financial statements** — SEC XBRL companyfacts, pulled "
+            f"{meta['fetched_at']:%H:%M}:\n"
+            f"`https://data.sec.gov/api/xbrl/companyfacts/CIK{meta['cik']:010d}.json`\n\n"
+            f"**Risk-free rate** — FRED series DGS10 (10-year constant-maturity Treasury): "
+            f"{wacc_result.risk_free_rate:.2%}\n\n"
+            f"**Price / beta / shares** — "
+            + ("Yahoo Finance, as of " + price_fetched_at.strftime("%H:%M")
+               if yahoo_ok else "manual overrides (Yahoo unavailable this session)")
+            + f"\n\n**Equity risk premium** — user-set {erp:.2%} "
+            "(Damodaran's implied US ERP is the standard anchor)\n\n"
+            "The Audit tab shows exactly which XBRL tag produced every line item."
+        )
+
     st.subheader("Projection")
     proj = gordon.projection.copy()
-    styled = proj.style.format(
-        lambda v: f"{v:.1%}" if abs(v) < 5 else f"{v:,.0f}", na_rep="—")
-    st.dataframe(styled, width="stretch")
+    PCT_ROWS = {"Revenue growth", "EBIT margin", "Discount factor"}
+    COUNT_ROWS = {"Discount period"}
 
+    def _fmt_projection_row(row):
+        if row.name in PCT_ROWS:
+            return row.map(lambda v: f"{v:.1%}")
+        if row.name in COUNT_ROWS:
+            return row.map(lambda v: f"{v:.1f}")
+        return row.map(lambda v: fmt_money(v, 1))
+
+    st.dataframe(proj.apply(_fmt_projection_row, axis=1), width="stretch")
     st.caption(
-        f"Terminal value is {gordon.tv_share_of_ev:.0%} of enterprise value "
-        f"({fmt_money(gordon.pv_terminal_value)} of {fmt_money(gordon.enterprise_value)}). "
-        f"Gordon growth implies an exit multiple of {gordon.implied_exit_multiple:.1f}× EBITDA; "
-        f"the {exit_multiple:.1f}× exit multiple implies "
-        f"{exit_case.implied_growth_from_multiple:.2%} perpetual growth."
+        "Discount factor and PV of UFCF are the last two rows — the per-year discounting "
+        "is fully visible, not folded into a single NPV."
     )
 
 with tabs[1]:
+    show(plot_monte_carlo(mc, market.price, gordon.value_per_share))
+
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Mean", f"${mc.mean:,.2f}")
+    m2.metric("Median", f"${mc.median:,.2f}")
+    m3.metric("Std dev", f"${mc.std:,.2f}")
+    m4.metric("P5 – P95", f"${mc.percentiles['5']:,.0f}–${mc.percentiles['95']:,.0f}")
+    m5.metric("P(undervalued)", f"{mc.prob_above_price:.0%}",
+              help="Share of simulated intrinsic values above the current market price")
+    m6.metric("P(overvalued)", f"{1 - mc.prob_above_price:.0%}")
+
+    import math  # noqa: E402
+    se_mean = 1.96 * mc.std / math.sqrt(mc.n_valid)
+    st.caption(
+        f"{mc.n_valid:,} valid paths computed in {mc.runtime_seconds*1000:.0f} ms "
+        f"(fully vectorised — that speed is real, not a skipped simulation) · "
+        f"{mc.n_discarded:,} draws discarded as infeasible (g ≥ WACC) · "
+        f"mean is stable to ±${se_mean:.2f} at this path count (95% CI). "
+        + (f"**{mc.share_negative:.0%} of paths end in negative equity value.**"
+           if mc.share_negative > 0.01 else "")
+    )
+
+    st.subheader("What is being sampled")
+    st.dataframe(pd.DataFrame({
+        "Input": ["Year-1 revenue growth", "Terminal EBIT margin", "WACC",
+                  "Terminal growth", "Capex % of revenue"],
+        "Distribution": ["Normal", "Normal (truncated)", "Normal", "Triangular", "Normal"],
+        "Centre": [f"{g1:.1%}", f"{margin:.1%}", f"{wacc:.2%}",
+                   f"{mc_tg_bounds[1]:.2%}", f"{capex_pct:.2%}"],
+        "Spread": [f"σ = {mc_growth_sd:.1%} (5-yr historical vol)",
+                   f"σ = {mc_margin_sd:.1%} (5-yr historical vol)",
+                   f"σ = {mc_wacc_sd:.1%}",
+                   f"[{mc_tg_bounds[0]:.2%}, {mc_tg_bounds[2]:.2%}] — hard GDP ceiling",
+                   f"σ = {mc_capex_sd:.2%}"],
+    }), hide_index=True, width="stretch")
+    st.caption(
+        "Everything else — tax rate, D&A intensity, NWC intensity, the balance-sheet "
+        "bridge — is held at its base value: those are either policy numbers or "
+        "balance-sheet facts, not sources of forecast uncertainty."
+    )
+
+    st.subheader("Which input drives the spread")
+    show(plot_driver_tornado(driver_attribution(mc)))
+
+with tabs[2]:
     show(plot_sensitivity_heatmap(grid, market.price))
     st.subheader("Scenarios")
     st.dataframe(
@@ -337,16 +512,6 @@ with tabs[1]:
         "Sensitivity varies one or two inputs across a grid; scenarios move a coherent set "
         "together. Both differ from the Monte Carlo, which samples every input jointly."
     )
-
-with tabs[2]:
-    show(plot_monte_carlo(mc, market.price, gordon.value_per_share))
-    left, right = st.columns([1, 1.4])
-    with left:
-        st.dataframe(mc.summary_frame(), width="stretch")
-        st.caption(f"{mc.n_valid:,} valid paths in {mc.runtime_seconds:.2f}s · "
-                   f"{mc.n_discarded:,} discarded as infeasible (g ≥ WACC)")
-    with right:
-        show(plot_driver_tornado(driver_attribution(mc)))
 
 with tabs[3]:
     st.caption("Add peer multiples to include a comps range.")

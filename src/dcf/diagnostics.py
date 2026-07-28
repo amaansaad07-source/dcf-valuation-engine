@@ -4,7 +4,7 @@ A valuation model has no R-squared. Quality is data integrity plus internal cons
 and every row here is a check a reviewer would run before believing the number.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -84,3 +84,80 @@ def valuation_diagnostics(
         add("WACC construction warnings", f"{len(wacc_result.notes)} flagged", "0", False)
 
     return pd.DataFrame(checks)
+
+
+def assess_dcf_suitability(drivers: pd.DataFrame) -> Tuple[str, List[str]]:
+    """Is a single-stage unlevered DCF the right tool for this company at all?
+
+    Returns a verdict in {"suitable", "caution", "unsuitable"} plus the reasons. This runs
+    BEFORE anyone looks at a number, because the worst failure mode is not a crash — it is
+    a confident valuation of a company the method does not apply to.
+    """
+    issues: List[str] = []
+    verdict = "suitable"
+
+    def escalate(level: str) -> None:
+        nonlocal verdict
+        order = {"suitable": 0, "caution": 1, "unsuitable": 2}
+        if order[level] > order[verdict]:
+            verdict = level
+
+    latest = drivers.iloc[-1]
+    ebit_latest = float(latest.get("ebit", np.nan))
+    ebit_med3 = float(drivers["ebit"].tail(3).median())
+    ebitda_latest = float(latest.get("ebitda", np.nan))
+
+    if np.isfinite(ebit_latest) and np.isfinite(ebit_med3) and ebit_latest < 0 and ebit_med3 < 0:
+        escalate("unsuitable")
+        issues.append(
+            "Operating losses in the latest year AND the 3-year median. A Gordon terminal "
+            "value on negative cash flow projects the company burning cash in perpetuity — "
+            "mathematically valid, financially meaningless. Pre-profitability names need a "
+            "10–15 year horizon with an explicit margin ramp and a terminal value off "
+            "normalised EBITDA, not this single-stage model."
+        )
+    elif (np.isfinite(ebit_latest) and ebit_latest < 0) or (np.isfinite(ebit_med3) and ebit_med3 < 0):
+        escalate("caution")
+        issues.append(
+            "EBIT is negative in at least one recent period. The forecast anchors on "
+            "medians that include losses — inspect the seeded margin path before trusting "
+            "the output."
+        )
+
+    if np.isfinite(ebitda_latest) and ebitda_latest <= 0:
+        escalate("unsuitable")
+        issues.append(
+            "EBITDA is not positive, so the exit-multiple terminal value is undefined and "
+            "the Gordon cross-check has nothing to reconcile against."
+        )
+
+    capex_med = float(drivers["capex_pct_revenue"].tail(3).median())
+    if np.isfinite(capex_med) and capex_med > 0.30:
+        escalate("caution")
+        issues.append(
+            f"Capex is running at {capex_med:.0%} of revenue — build-out phase economics. "
+            "Steady-state intensity is likely far lower; the seeded value will overstate "
+            "perpetual reinvestment."
+        )
+
+    growth_med = float(drivers["revenue_growth"].tail(3).median())
+    if np.isfinite(growth_med) and growth_med > 0.40:
+        escalate("caution")
+        issues.append(
+            f"Median revenue growth of {growth_med:.0%} cannot persist. The five-year fade "
+            "to terminal growth compresses a long transition into a short window."
+        )
+
+    if len(drivers) < 4:
+        escalate("caution")
+        issues.append(
+            f"Only {len(drivers)} fiscal years of history — the medians anchoring the "
+            "forecast are closer to anecdotes than statistics."
+        )
+
+    ufcf3 = drivers["ufcf_historical"].tail(3)
+    if ufcf3.notna().all() and (ufcf3 < 0).all():
+        escalate("unsuitable" if verdict == "unsuitable" else "caution")
+        issues.append("Unlevered FCF has been negative in each of the last three years.")
+
+    return verdict, issues

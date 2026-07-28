@@ -28,6 +28,7 @@ class MonteCarloResult:
     n_discarded: int
     inputs: pd.DataFrame
     runtime_seconds: float
+    share_negative: float = 0.0    # fraction of paths ending in negative equity value
 
     def summary_frame(self) -> pd.DataFrame:
         rows = {f"P{k}": v for k, v in self.percentiles.items()}
@@ -99,7 +100,7 @@ def monte_carlo_dcf(
     margin_paths = margin_start * (1 - fade) + margin_target[:, None] * fade
 
     ebit = revenue * margin_paths
-    nopat = ebit * (1 - a.tax_rate)
+    nopat = ebit - np.maximum(ebit, 0.0) * a.tax_rate   # no tax subsidy on losses
     d_and_a = revenue * a.da_pct_revenue
     capex = revenue * capex_pct[:, None]
     ebitda = ebit + d_and_a
@@ -129,9 +130,18 @@ def monte_carlo_dcf(
     equity_value = enterprise_value + bridge_adjustment
     per_share = equity_value / shares
 
-    # Drop pathological tails (negative equity, or values >100× the base) before stats
-    sane = np.isfinite(per_share) & (per_share > 0)
+    # Keep every finite outcome, INCLUDING negatives. A path where equity is worthless
+    # is information, not noise — filtering it out silently inflated the distribution for
+    # loss-making companies (and crashed outright when every path was negative).
+    sane = np.isfinite(per_share)
     per_share_clean = per_share[sane]
+    if per_share_clean.size == 0:
+        raise ValueError(
+            "Monte Carlo produced no finite outcomes — the input ranges are outside the "
+            "space where this model is defined. This usually means a deeply loss-making "
+            "company; a single-stage DCF is the wrong tool for it."
+        )
+    share_negative = float((per_share_clean <= 0).mean())
 
     pct_levels = [1, 5, 10, 25, 50, 75, 90, 95, 99]
     percentiles = {str(p): float(np.percentile(per_share_clean, p)) for p in pct_levels}
@@ -158,6 +168,7 @@ def monte_carlo_dcf(
         std=float(per_share_clean.std()),
         n_valid=len(per_share_clean),
         n_discarded=n_discarded,
+        share_negative=share_negative,
         inputs=inputs,
         runtime_seconds=runtime,
     )
@@ -172,6 +183,8 @@ def driver_attribution(mc: MonteCarloResult) -> pd.DataFrame:
     target = mc.inputs["Value per share"]
     rows = []
     for col in mc.inputs.columns.drop("Value per share"):
+        if mc.inputs[col].nunique() < 2 or target.nunique() < 2:
+            continue                                     # constant input → no correlation
         rho, p_value = stats.spearmanr(mc.inputs[col], target)
         rows.append({"Driver": col, "Rank correlation": rho, "p-value": p_value,
                      "Contribution to variance": rho ** 2})

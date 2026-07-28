@@ -7,7 +7,7 @@ intermediate artefact for inspection.
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -24,7 +24,7 @@ from .charts import (
 )
 from .config import fmt_money, fmt_pct, log
 from .dcf import DCFResult, run_dcf
-from .diagnostics import valuation_diagnostics
+from .diagnostics import assess_dcf_suitability, valuation_diagnostics
 from .drivers import build_driver_table
 from .market_data import MarketData, fetch_market_data
 from .monte_carlo import MonteCarloResult, monte_carlo_dcf
@@ -49,6 +49,7 @@ class Valuation:
     scenarios: pd.DataFrame
     monte_carlo: Optional[MonteCarloResult]
     diagnostics: pd.DataFrame
+    suitability: Tuple[str, List[str]] = ("suitable", [])
 
     def tearsheet(self) -> None:
         """Print the one-screen summary you would paste into an email."""
@@ -57,6 +58,12 @@ class Valuation:
         print(rule)
         print(f"  {self.meta['name']} ({self.meta['ticker']})  │  CIK {self.meta['cik']}")
         print(rule)
+        verdict, issues = self.suitability
+        if verdict != "suitable":
+            print(f"  {'⛔' if verdict == 'unsuitable' else '⚠️ '} DCF SUITABILITY: {verdict.upper()}")
+            for issue in issues:
+                print(f"     {issue}")
+            print(rule)
         print(f"  Current price            {fmt_money(m.price, 2)}")
         print(f"  Market capitalisation    {fmt_money(m.market_cap)}")
         print(f"  WACC                     {fmt_pct(self.wacc_result.wacc, 2)}"
@@ -167,6 +174,12 @@ def run_valuation(
     history, report, meta = fetch_financial_history(ticker, years_history)
     drivers = build_driver_table(history, report)
 
+    verdict, suitability_issues = assess_dcf_suitability(drivers)
+    if verdict != "suitable":
+        log.warning("DCF suitability: %s for %s", verdict.upper(), meta["ticker"])
+        for issue in suitability_issues:
+            log.warning("  · %s", issue)
+
     # 2 ── Market inputs ----------------------------------------------------------------
     sec_shares = float(drivers["diluted_shares"].iloc[-1]) \
         if np.isfinite(drivers["diluted_shares"].iloc[-1]) else None
@@ -227,6 +240,7 @@ def run_valuation(
         meta=meta, drivers=drivers, report=report, market=market, wacc_result=wacc_result,
         assumptions=a, gordon=gordon, exit_multiple=exit_case, sensitivity=sensitivity,
         scenarios=scenarios, monte_carlo=mc, diagnostics=diagnostics,
+        suitability=(verdict, suitability_issues),
     )
     if peer_ev_ebitda:
         valuation.meta["peer_ev_ebitda"] = peer_ev_ebitda

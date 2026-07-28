@@ -20,7 +20,7 @@ from .charts import (
 )
 from .config import CFG, PALETTE, Config, fmt_money, fmt_pct
 from .dcf import DCFResult, build_bridge, project_financials, run_dcf
-from .diagnostics import valuation_diagnostics
+from .diagnostics import assess_dcf_suitability, valuation_diagnostics
 from .drivers import DRIVER_VIEW, build_driver_table, display_drivers, summarise_drivers
 from .engine import Valuation, run_valuation
 from .export import export_valuation
@@ -58,7 +58,7 @@ __all__ = [
     # Output
     "plot_ev_to_equity_waterfall", "plot_ufcf_bridge", "plot_sensitivity_heatmap",
     "plot_football_field", "plot_monte_carlo", "plot_historical_drivers",
-    "plot_driver_tornado", "export_valuation", "valuation_diagnostics",
+    "plot_driver_tornado", "export_valuation", "valuation_diagnostics", "assess_dcf_suitability",
     # Configuration
     "CFG", "Config", "PALETTE", "fmt_money", "fmt_pct",
 ]

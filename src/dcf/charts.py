@@ -5,6 +5,7 @@ One palette, direct labelling, banker money formatting, no chartjunk.
 
 from typing import Dict, Optional, Tuple
 
+import matplotlib as mpl
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -134,30 +135,41 @@ def plot_sensitivity_heatmap(grid: pd.DataFrame, current_price: Optional[float] 
     values = grid.to_numpy(dtype=float)
     if current_price:
         colour_basis = values / current_price - 1
-        vlim = np.nanmax(np.abs(colour_basis)) or 0.01
-        mesh = ax.imshow(colour_basis, cmap="RdYlGn", vmin=-vlim, vmax=vlim, aspect="auto")
+        finite = colour_basis[np.isfinite(colour_basis)]
+        lo, hi = (float(finite.min()), float(finite.max())) if finite.size else (-0.01, 0.01)
+        # Anchor the diverging map at zero upside but let each side stretch to the data.
+        # The old symmetric ±max scaling saturated the whole grid deep red whenever every
+        # cell sat below the market price, hiding all the structure within the grid.
+        if lo < 0 < hi:
+            norm = mpl.colors.TwoSlopeNorm(vmin=lo, vcenter=0.0, vmax=hi)
+            mesh = ax.imshow(colour_basis, cmap="RdYlGn", norm=norm, aspect="auto")
+        else:
+            # Every cell on one side of the price: use the data range so gradation survives
+            pad = (hi - lo) * 0.05 or abs(hi) * 0.05 or 0.01
+            mesh = ax.imshow(colour_basis, cmap="RdYlGn", vmin=lo - pad, vmax=hi + pad,
+                             aspect="auto")
         cbar_label = "Upside / (downside) vs current price"
     else:
         mesh = ax.imshow(values, cmap="Blues", aspect="auto")
         cbar_label = "Value per share"
 
     ax.set_xticks(range(len(grid.columns)))
-    ax.set_xticklabels(grid.columns)
+    ax.set_xticklabels(grid.columns, fontsize=10.5)
     ax.set_yticks(range(len(grid.index)))
-    ax.set_yticklabels(grid.index)
-    ax.set_xlabel("Terminal growth rate")
-    ax.set_ylabel("WACC")
-    ax.set_title(title)
+    ax.set_yticklabels(grid.index, fontsize=10.5)
+    ax.set_xlabel("Terminal growth rate", fontsize=11)
+    ax.set_ylabel("WACC", fontsize=11)
+    ax.set_title(title, pad=12)
     ax.grid(False)
 
     for i in range(values.shape[0]):
         for j in range(values.shape[1]):
             v = values[i, j]
             if not np.isfinite(v):
-                ax.text(j, i, "n/m", ha="center", va="center", fontsize=8, color=PALETTE["grey"])
+                ax.text(j, i, "n/m", ha="center", va="center", fontsize=9, color=PALETTE["grey"])
                 continue
-            label = f"${v:,.0f}" if v >= 100 else f"${v:,.2f}"
-            ax.text(j, i, label, ha="center", va="center", fontsize=8.5,
+            label = f"${v:,.0f}" if abs(v) >= 100 else f"${v:,.2f}"
+            ax.text(j, i, label, ha="center", va="center", fontsize=10,
                     color=PALETTE["ink"], fontweight="medium")
 
     cbar = plt.colorbar(mesh, ax=ax, fraction=0.035, pad=0.02)
@@ -257,16 +269,27 @@ def plot_monte_carlo(mc: MonteCarloResult, current_price: Optional[float] = None
         _, ax = plt.subplots(figsize=(11, 5.5))
 
     values = mc.values_per_share
-    # Trim the extreme tail so one 500× outlier does not flatten the whole histogram
-    upper = np.percentile(values, 99.5)
-    trimmed = values[values <= upper]
+    # Trim both extreme tails so a handful of outlier paths cannot flatten the histogram
+    lo_t, hi_t = np.percentile(values, [0.5, 99.5])
+    trimmed = values[(values >= lo_t) & (values <= hi_t)]
+    if trimmed.size < 10:
+        trimmed = values
 
     ax.hist(trimmed, bins=90, color=PALETTE["sky"], edgecolor="white", linewidth=0.4, zorder=3)
 
-    kde = stats.gaussian_kde(trimmed)
-    grid = np.linspace(trimmed.min(), trimmed.max(), 400)
-    scale = len(trimmed) * (trimmed.max() - trimmed.min()) / 90
-    ax.plot(grid, kde(grid) * scale, color=PALETTE["navy"], linewidth=1.8, zorder=4)
+    # KDE overlay only when it is well defined; skip silently for degenerate samples
+    if trimmed.size >= 30 and float(np.std(trimmed)) > 1e-9:
+        kde = stats.gaussian_kde(trimmed)
+        grid = np.linspace(trimmed.min(), trimmed.max(), 400)
+        scale = len(trimmed) * (trimmed.max() - trimmed.min()) / 90
+        ax.plot(grid, kde(grid) * scale, color=PALETTE["navy"], linewidth=1.8, zorder=4)
+
+    if trimmed.min() < 0:
+        ax.axvline(0, color=PALETTE["ink"], linewidth=1.0, alpha=0.6, zorder=4)
+    if getattr(mc, "share_negative", 0.0) > 0.01:
+        ax.annotate(f"{mc.share_negative:.0%} of paths end in negative equity value",
+                    xy=(0.02, 0.95), xycoords="axes fraction", fontsize=8.5,
+                    color=PALETTE["red"], ha="left", va="top")
 
     p10, p50, p90 = (mc.percentiles["10"], mc.percentiles["50"], mc.percentiles["90"])
     for value, label, colour, style in [

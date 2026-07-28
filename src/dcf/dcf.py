@@ -54,7 +54,10 @@ def project_financials(drivers: pd.DataFrame, a: Assumptions) -> pd.DataFrame:
 
     revenue = base_revenue * np.cumprod(1 + growth)
     ebit = revenue * margin
-    nopat = ebit * (1 - a.tax_rate)
+    # Tax applies to positive EBIT only. Taxing a loss at 21% would book a cash refund
+    # the company cannot claim — real losses become NOL carryforwards, not cash today.
+    taxes = np.maximum(ebit, 0.0) * a.tax_rate
+    nopat = ebit - taxes
     d_and_a = revenue * a.da_pct_revenue
     capex = revenue * a.capex_pct_revenue
     ebitda = ebit + d_and_a
@@ -76,7 +79,7 @@ def project_financials(drivers: pd.DataFrame, a: Assumptions) -> pd.DataFrame:
             "EBIT": ebit,
             "EBIT margin": margin,
             "EBITDA": ebitda,
-            "Taxes on EBIT": -ebit * a.tax_rate,
+            "Taxes on EBIT": -taxes,
             "NOPAT": nopat,
             "(+) D&A": d_and_a,
             "(−) Capex": -capex,
